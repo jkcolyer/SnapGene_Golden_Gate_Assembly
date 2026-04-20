@@ -17,6 +17,9 @@ Barcode assignment rules:
 from __future__ import annotations
 
 import io
+import os as _os
+import re as _re
+import struct as _struct
 import zipfile
 from collections import Counter
 from typing import Dict, List, Optional, Set, Tuple
@@ -275,21 +278,23 @@ def assign_barcodes(
             # ---- Ensure the (oh5, oh3) pair is unique ----
             pair = (nb_oh5, nb_oh3)
             if pair in used_pairs:
-                # Try replacing oh3 barcode with the next-least-used NB
-                # that produces a unique pair
-                for nb_candidate in sorted(_ALL_NB_LABELS, key=lambda x: usage.get(x, 0)):
-                    if nb_candidate == nb_oh5:
-                        continue
-                    if (nb_oh5, nb_candidate) not in used_pairs:
-                        # Undo the previous oh3 assignment if it was new
-                        if not oh3_reused:
-                            usage[nb_oh3] = max(0, usage.get(nb_oh3, 1) - 1)
-                        nb_oh3 = nb_candidate
-                        oh_to_nb[oh3] = nb_oh3
-                        usage[nb_oh3] = usage.get(nb_oh3, 0) + 1
-                        oh3_reused = False  # it's a new assignment now
-                        pair = (nb_oh5, nb_oh3)
-                        break
+                # If BOTH barcodes come from existing history (both reused), the pair
+                # belongs to this fragment by definition — accept it without changing.
+                # Only try to reassign when at least one barcode was freshly allocated.
+                if not (oh5_reused and oh3_reused):
+                    for nb_candidate in sorted(_ALL_NB_LABELS, key=lambda x: usage.get(x, 0)):
+                        if nb_candidate == nb_oh5:
+                            continue
+                        if (nb_oh5, nb_candidate) not in used_pairs:
+                            # Undo the previous oh3 assignment if it was new
+                            if not oh3_reused:
+                                usage[nb_oh3] = max(0, usage.get(nb_oh3, 1) - 1)
+                            nb_oh3 = nb_candidate
+                            oh_to_nb[oh3] = nb_oh3
+                            usage[nb_oh3] = usage.get(nb_oh3, 0) + 1
+                            oh3_reused = False  # it's a new assignment now
+                            pair = (nb_oh5, nb_oh3)
+                            break
 
             used_pairs.add(pair)
 
@@ -686,9 +691,10 @@ def generate_all_barcode_files(
             if adp3_path not in files:
                 files[adp3_path] = build_adapter_dna_bytes(nb_oh3, oh3)
 
-            # ---- Ligation product ----
-            lig_path = f"{folder}/Ligation.dna"
-            files[lig_path] = build_ligation_bytes(frag, nb_oh5, nb_oh3, is_a1, is_e_last)
+            # ---- Ligation product (only if fragment sequence is available) ----
+            if frag.sequence:
+                lig_path = f"{folder}/Ligation.dna"
+                files[lig_path] = build_ligation_bytes(frag, nb_oh5, nb_oh3, is_a1, is_e_last)
 
     return files
 
@@ -759,6 +765,201 @@ def build_barcode_excel(
 # ---------------------------------------------------------------------------
 # ZIP helpers
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Gene folder ZIP parsing  (import existing work)
+# ---------------------------------------------------------------------------
+
+def _extract_sequence_from_dna_bytes(data: bytes) -> str:
+    """
+    Extract the DNA sequence string from a SnapGene .dna binary file.
+
+    Walks the packet stream looking for the DNA packet (type 0x00).
+    Payload layout: [1-byte flags][ASCII sequence…]
+    """
+    i = 0
+    while i + 5 <= len(data):
+        ptype = data[i]
+        plen  = _struct.unpack(">I", data[i + 1 : i + 5])[0]
+        if ptype == 0x00 and i + 5 + plen <= len(data):
+            payload = data[i + 5 : i + 5 + plen]
+            return payload[1:].decode("ascii", errors="ignore").upper()
+        i += 5 + plen
+    return ""
+
+
+def _normalize_part_label_zip(raw: str) -> str:
+    """
+    Convert a raw Part folder-name fragment to a canonical Part label.
+    Handles: 'A', 'B', 'C', 'D', "D'", 'Dprime', 'D_prime', 'D prime', 'E'.
+    All D variants map to 'Dprime'.
+    """
+    s = raw.strip().upper().replace("'", "").replace("_", "").replace(" ", "")
+    if s.startswith("D"):          # D, Dprime, Dprime → all map to Dprime
+        return "Dprime"
+    if s in ("A", "B", "C", "E"):
+        return s
+    return s  # pass through unknown labels
+
+
+def _parse_ligation_sequence(
+    seq: str,
+    is_first_of_a: bool = False,
+    is_last_of_e: bool = False,
+) -> Tuple[str, str, str]:
+    """
+    Extract (oh5, oh3, fragment_sequence) from a Ligation.dna top-strand sequence.
+
+    Top-strand layout
+    -----------------
+      0–35   (36 nt) : left native adapter
+      36–75  (40 nt) : NB_oh5 TopStrand
+      76–79  ( 4 nt) : oh5 junction
+    [ 80–84  ( 5 nt) : ATATC EcoRV  — only if is_first_of_a ]
+               ...   : fragment insert  (variable length)
+    [        ( 5 nt) : ATATC EcoRV  — only if is_last_of_e  ]
+      –80–   (50 nt) : NB_oh3 BottomStrand  (starts at len-80)
+      –30–   (30 nt) : right native adapter  (last 30 nt)
+
+    The first 4 nt of BottomStrand = revcomp(oh3), so oh3 = revcomp of those 4 nt.
+    """
+    s = seq.upper()
+    oh5 = s[76:80]
+
+    frag_start = 80 + (5 if is_first_of_a else 0)
+    bot_start  = len(s) - 80          # BottomStrand starts 80 nt from the end
+    frag_end   = bot_start - (5 if is_last_of_e else 0)
+
+    frag_seq = s[frag_start:frag_end]
+    oh3      = _revcomp(s[bot_start : bot_start + 4])
+
+    return oh5, oh3, frag_seq
+
+
+def parse_gene_folder_zip(
+    zip_bytes: bytes,
+) -> Tuple[List[Part], Dict[str, str], Set[Tuple[str, str]]]:
+    """
+    Parse a ZIP archive of an existing gene folder to reconstruct fragment data
+    and barcode assignment history.
+
+    The tool scans for two types of information:
+
+    1. **XXXX_NBNN.dna file names** (annealed adapter files):
+       revcomp(XXXX) is the overhang, NBNN is the barcode → builds oh_to_nb.
+
+    2. **Ligation.dna files** (one per fragment folder):
+       The sequence encodes oh5, oh3, and the fragment insert.
+       Parsed using the known fixed-length structure of the ligation product.
+
+    Expected folder pattern (flexible): any path containing
+      ``<Part label>/<Part label>.<fragment number>/``
+    e.g.  ``CYP2D7/Part A/A.1/...``  or  ``Part_D'/D'.3/...``
+
+    Returns
+    -------
+    parts      : List of Part objects, sequences filled where Ligation.dna found.
+    oh_to_nb   : dict  overhang (4 bp) → NB label, e.g. {"GGAG": "NB25", …}
+    used_pairs : set of (nb_oh5, nb_oh3) tuples already committed in this folder.
+    """
+    # Matches XXXX_NBNN.dna  (adapter/barcode annealed files)
+    adapter_re = _re.compile(r"^([ACGT]{4})_(NB\d{2})\.dna$", _re.IGNORECASE)
+
+    # Matches  /A.1/  or  /D'.5/  or  /Dprime.10/  anywhere in a path
+    frag_re = _re.compile(
+        r"/([A-Ea-e][^./\s]*?)\.(\d+)(?:/|$)",
+        _re.IGNORECASE,
+    )
+
+    oh_to_nb: Dict[str, str] = {}
+    # {(canonical_label, frag_num): {"oh5": str, "oh3": str, "seq": str}}
+    found: Dict[Tuple[str, int], Dict[str, str]] = {}
+
+    def _key(norm_path: str) -> Optional[Tuple[str, int]]:
+        m = frag_re.search(norm_path)
+        if m is None:
+            return None
+        label = _normalize_part_label_zip(m.group(1))
+        if label not in ("A", "B", "C", "Dprime", "E"):
+            return None
+        return (label, int(m.group(2)))
+
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        names = zf.namelist()
+
+        # ---- Pass 1: collect fragment keys + oh_to_nb from adapter file names ----
+        for name in names:
+            norm = name.replace("\\", "/")
+            key  = _key(norm)
+            if key is None:
+                continue
+            if key not in found:
+                found[key] = {"oh5": "", "oh3": "", "seq": ""}
+
+            filename = _os.path.basename(norm)
+            am = adapter_re.match(filename)
+            if am:
+                oh = _revcomp(am.group(1).upper())
+                nb = am.group(2).upper()
+                oh_to_nb[oh] = nb
+
+        # Determine last frag index in Part E (needed to detect is_last_of_e)
+        e_frags   = [fn for (lbl, fn) in found if lbl == "E"]
+        max_e_idx = max(e_frags) if e_frags else -1
+
+        # ---- Pass 2: parse Ligation.dna files ----
+        for name in names:
+            norm     = name.replace("\\", "/")
+            filename = _os.path.basename(norm)
+            if filename.lower() != "ligation.dna":
+                continue
+            key = _key(norm)
+            if key is None or key not in found:
+                continue
+            part_label, frag_num = key
+            is_a1     = (part_label == "A" and frag_num == 1)
+            is_e_last = (part_label == "E" and frag_num == max_e_idx)
+            try:
+                raw  = zf.read(name)
+                seq  = _extract_sequence_from_dna_bytes(raw)
+                if len(seq) > 160:   # sanity check — must be longer than fixed flanks
+                    oh5, oh3, frag_seq = _parse_ligation_sequence(seq, is_a1, is_e_last)
+                    found[key]["oh5"] = oh5
+                    found[key]["oh3"] = oh3
+                    found[key]["seq"] = frag_seq
+                    # Register in oh_to_nb if adapter files were missing
+                    # (adapter files are the primary source; this is a fallback)
+            except Exception:
+                pass   # skip malformed files silently
+
+    # ---- Reconstruct used_pairs from parsed fragment overhangs ----
+    used_pairs: Set[Tuple[str, str]] = set()
+    for data in found.values():
+        oh5, oh3 = data["oh5"], data["oh3"]
+        if oh5 in oh_to_nb and oh3 in oh_to_nb:
+            used_pairs.add((oh_to_nb[oh5], oh_to_nb[oh3]))
+
+    # ---- Build Part / Fragment objects ----
+    parts_dict: Dict[str, List[Fragment]] = {}
+    for (label, frag_num), data in found.items():
+        frag = Fragment(
+            name=f"splitseq_{frag_num}",
+            sequence=data["seq"],
+            overhang_5=data["oh5"],
+            overhang_3=data["oh3"],
+            part_label=label,
+            index=frag_num,
+        )
+        parts_dict.setdefault(label, []).append(frag)
+
+    part_order  = ["A", "B", "C", "Dprime", "E"]
+    parts_out: List[Part] = []
+    for lbl in sorted(parts_dict, key=lambda x: part_order.index(x) if x in part_order else 99):
+        frags = sorted(parts_dict[lbl], key=lambda f: f.index)
+        parts_out.append(Part(label=lbl, fragments=frags))
+
+    return parts_out, oh_to_nb, used_pairs
+
 
 def build_barcode_zip(files: Dict[str, bytes]) -> bytes:
     """Return a ZIP archive (bytes) of the provided {path: bytes} dict."""
