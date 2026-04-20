@@ -68,16 +68,25 @@ def _notes_packet(name: str, created_by: str = "Athey lab") -> bytes:
     return _pack_packet(0x0B, xml.encode("utf-8"))
 
 
-def _additional_props_packet(extra_xml: str = "") -> bytes:
+def _additional_props_packet(
+    upstream_sticky: int = 0,
+    downstream_sticky: int = 0,
+    upstream_mod: str = "Unmodified",
+    downstream_mod: str = "Unmodified",
+) -> bytes:
     """
     Type 0x07 – AdditionalSequenceProperties.
-    For ligation products use phosphorylated ends.
+    Controls stickiness (overhang length/direction) and end modifications.
+    Positive stickiness = 3' overhang (downstream), negative = 5' recessed.
     """
-    inner = extra_xml or (
-        "<UpstreamModification>FivePrimePhosphorylated</UpstreamModification>"
-        "<DownstreamModification>FivePrimePhosphorylated</DownstreamModification>"
+    xml = (
+        f'<AdditionalSequenceProperties>'
+        f'<UpstreamStickiness>{upstream_sticky}</UpstreamStickiness>'
+        f'<DownstreamStickiness>{downstream_sticky}</DownstreamStickiness>'
+        f'<UpstreamModification>{upstream_mod}</UpstreamModification>'
+        f'<DownstreamModification>{downstream_mod}</DownstreamModification>'
+        f'</AdditionalSequenceProperties>'
     )
-    xml = f"<AdditionalSequenceProperties>{inner}</AdditionalSequenceProperties>"
     return _pack_packet(0x07, xml.encode("utf-8"))
 
 
@@ -113,6 +122,32 @@ def make_feature(
     }
 
 
+def make_multiseg_feature(
+    name: str,
+    segments: list,
+    ftype: str = "misc_feature",
+) -> dict:
+    """
+    Return a dict representing a multi-segment feature annotation.
+
+    Parameters
+    ----------
+    name     : feature name shown in SnapGene
+    segments : list of dicts, each with keys:
+                 start (0-based inclusive),
+                 end   (0-based inclusive),
+                 color (hex string),
+                 name  (optional segment label)
+    ftype    : SnapGene feature type string (default "misc_feature")
+    """
+    return {
+        "name": name,
+        "type": ftype,
+        "multiseg": True,
+        "segments": segments,
+    }
+
+
 def make_primer_feature(
     name: str,
     start: int,      # 0-based inclusive in sequence
@@ -136,6 +171,8 @@ def _features_packet(features: List[Dict]) -> bytes:
     """
     Type 0x08 – Features XML.
     Each feature becomes a <Feature> element.
+    Multi-segment features (multiseg=True) emit one <Segment> per entry in
+    the ``segments`` list; each segment may have its own name and color.
     """
     if not features:
         return b""
@@ -150,11 +187,24 @@ def _features_packet(features: List[Dict]) -> bytes:
             f'allowSegmentOverlaps="0" '
             f'consecutiveTranslationNumbering="0">'
         )
-        color = f.get("color", "#a6acb3")
-        parts.append(
-            f'<Segment range="{f["start"]+1}-{f["end"]+1}" '
-            f'color="{color}" type="standard"/>'
-        )
+        if f.get("multiseg"):
+            # Multi-segment feature: one <Segment> per dict in f["segments"]
+            for seg in f["segments"]:
+                seg_name = seg.get("name", "")
+                seg_color = seg.get("color", "#a6acb3")
+                # seg start/end are 0-based inclusive; XML wants 1-based inclusive
+                seg_range = f'{seg["start"]+1}-{seg["end"]+1}'
+                name_attr = f' name="{_xml_escape(seg_name)}"' if seg_name else ''
+                parts.append(
+                    f'<Segment{name_attr} range="{seg_range}" '
+                    f'color="{seg_color}" type="standard"/>'
+                )
+        else:
+            color = f.get("color", "#a6acb3")
+            parts.append(
+                f'<Segment range="{f["start"]+1}-{f["end"]+1}" '
+                f'color="{color}" type="standard"/>'
+            )
         if f.get("note"):
             parts.append(
                 f'<Q name="note"><V predef="0" text="{_xml_escape(f["note"])}"/></Q>'
@@ -212,20 +262,30 @@ def write_dna_file(
     name: str = "construct",
     created_by: str = "Athey lab",
     add_phospho_ends: bool = True,
+    upstream_sticky: int = 0,
+    downstream_sticky: int = 0,
+    upstream_mod: str = "Unmodified",
+    downstream_mod: str = "Unmodified",
 ) -> None:
     """
     Write a SnapGene-compatible .dna file.
 
     Parameters
     ----------
-    path        : output file path (str)
-    sequence    : DNA sequence string (A/C/G/T)
-    is_circular : True → circular, False → linear
-    features    : list of feature dicts from make_feature()
-    primers     : list of primer dicts from make_primer_feature()
-    name        : construct name shown in SnapGene
-    created_by  : creator string for notes packet
-    add_phospho_ends : include phosphorylated-ends AdditionalProps packet
+    path             : output file path (str)
+    sequence         : DNA sequence string (A/C/G/T)
+    is_circular      : True → circular, False → linear
+    features         : list of feature dicts from make_feature() or make_multiseg_feature()
+    primers          : list of primer dicts from make_primer_feature()
+    name             : construct name shown in SnapGene
+    created_by       : creator string for notes packet
+    add_phospho_ends : if True, emit AdditionalProps with FivePrimePhosphorylated
+                       on both ends (legacy behaviour); if False, use the four
+                       sticky/mod keyword arguments instead.
+    upstream_sticky  : UpstreamStickiness value (used when add_phospho_ends=False)
+    downstream_sticky: DownstreamStickiness value (used when add_phospho_ends=False)
+    upstream_mod     : UpstreamModification string (used when add_phospho_ends=False)
+    downstream_mod   : DownstreamModification string (used when add_phospho_ends=False)
     """
     sequence = sequence.upper()
     data = _cookie_packet()
@@ -241,7 +301,64 @@ def write_dna_file(
         data += _primers_packet(primer_list)
 
     if add_phospho_ends:
-        data += _additional_props_packet()
+        data += _additional_props_packet(
+            upstream_mod="FivePrimePhosphorylated",
+            downstream_mod="FivePrimePhosphorylated",
+        )
+    else:
+        data += _additional_props_packet(
+            upstream_sticky=upstream_sticky,
+            downstream_sticky=downstream_sticky,
+            upstream_mod=upstream_mod,
+            downstream_mod=downstream_mod,
+        )
 
     with open(path, "wb") as fh:
         fh.write(data)
+
+
+def build_dna_bytes(
+    sequence: str,
+    is_circular: bool = False,
+    features: Optional[List[Dict]] = None,
+    primers: Optional[List[Dict]] = None,
+    name: str = "construct",
+    created_by: str = "Athey lab",
+    add_phospho_ends: bool = True,
+    upstream_sticky: int = 0,
+    downstream_sticky: int = 0,
+    upstream_mod: str = "Unmodified",
+    downstream_mod: str = "Unmodified",
+) -> bytes:
+    """
+    Same as write_dna_file but returns the binary content as bytes instead
+    of writing to disk.  Useful when the caller manages the output (e.g.
+    building a ZIP in memory).
+    """
+    sequence = sequence.upper()
+    data = _cookie_packet()
+    data += _dna_packet(sequence, is_circular)
+    data += _notes_packet(name, created_by)
+
+    feat_list = list(features or [])
+    if feat_list:
+        data += _features_packet(feat_list)
+
+    primer_list = list(primers or [])
+    if primer_list:
+        data += _primers_packet(primer_list)
+
+    if add_phospho_ends:
+        data += _additional_props_packet(
+            upstream_mod="FivePrimePhosphorylated",
+            downstream_mod="FivePrimePhosphorylated",
+        )
+    else:
+        data += _additional_props_packet(
+            upstream_sticky=upstream_sticky,
+            downstream_sticky=downstream_sticky,
+            upstream_mod=upstream_mod,
+            downstream_mod=downstream_mod,
+        )
+
+    return data
