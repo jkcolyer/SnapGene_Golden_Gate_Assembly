@@ -51,9 +51,9 @@ LV1_RIGHT_E = LV1_RIGHT_A
 # Constants
 # ---------------------------------------------------------------------------
 
-# PCR product: the insert begins 19 nt into the product (after the BsaI cut in
-# the fwd prefix).  The revcomp of the rev prefix (20 nt) follows the insert.
-PCR_INSERT_START = 19
+# PCR product: the insert begins 13 nt into the product (right after BsmBI cuts
+# following the fwd prefix).  The revcomp of the rev prefix (13 nt) follows.
+PCR_INSERT_START = 13
 
 # Part label normalisation
 _DPRIME = "Dprime"
@@ -205,7 +205,7 @@ def build_level0_seq(
     (circularized)
     """
     pcr = build_pcr_dna(frag, is_first_of_part_a, is_last_of_part_e)
-    insert = pcr[PCR_INSERT_START:]   # from BsaI cut site onward
+    insert = pcr[PCR_INSERT_START:]   # from BsmBI cut site onward (oh5 + insert + oh3-rc + prefix-rc)
 
     part = frag.part_label
     bb_left  = _LV0_BACKBONE_LEFT[part]

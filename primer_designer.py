@@ -6,12 +6,15 @@ directly with Fragment objects from fragment_splitter.py — no NEB metadata
 CSV required when calling from the pipeline.
 
 For each fragment the primers are:
-  Forward: [BsmBI outer tail] [BsaI inner tail] [4-nt 5' overhang] [gene-specific core]
-  Reverse: [BsmBI outer tail] [BsaI inner tail] [4-nt 3' overhang rc] [gene-specific core rc]
+  Forward: [13-nt BsmBI prefix] [4-nt 5' overhang] [gene-specific core]
+  Reverse: [13-nt BsmBI prefix] [4-nt 3' overhang rc] [gene-specific core rc]
+
+BsmBI (CGTCTC) in the prefix cuts 1 nt downstream, placing its cut exactly at the
+start of the 4-nt overhang — no extra bases are introduced into the insert.
 
 Special cases (pJUMP):
-  Part A, fragment 1   forward → uses FWD_PREFIX_A1  (includes GGAGATATC)
-  Part E, last fragment reverse → uses REV_PREFIX_E_LAST (includes GGAGATATC)
+  Part A, fragment 1   forward → ATATC (EcoRV) inserted between oh5 and gene core
+  Part E, last fragment reverse → ATATC (EcoRV) inserted between revcomp(oh3) and gene core
 """
 
 from __future__ import annotations
@@ -28,11 +31,21 @@ TM_MIN_BACKTRACK = 50.0
 MIN_LEN          = 10
 MAX_EXTRA_FOR_GC = 15
 
-# Standard prefixes (BsmBI outer + BsaI inner recognition sequences)
-# FWD_PREFIX is 19 nt; BsaI cuts at position 19 → exposes oh5 as the overhang.
-# REV_PREFIX is 20 nt; BsaI on the bottom strand cuts to expose oh3.
-FWD_PREFIX         = "GGCTACCGTCTCGGTCTCA"
-REV_PREFIX         = "GGCTACCGTCTCAGGTCTCA"
+# Standard prefixes — BsmBI-only design.
+#
+# Layout (forward):  [6-nt spacer] [CGTCTC] [1-nt spacer G]   = 13 nt
+#   BsmBI (CGTCTC) sits at positions 6–11; it cuts 1 nt downstream, i.e.
+#   between positions 12 and 13.  oh5 therefore starts at position 13 and
+#   is exposed directly as the 4-nt 5′ overhang — no extra bases.
+#
+# Layout (reverse):  [6-nt spacer] [CGTCTC] [1-nt spacer A]   = 13 nt
+#   Same geometry on the bottom strand; revcomp(oh3) starts at position 13.
+#
+# The previous design included a trailing BsaI site (GGTCTCA, 7 nt) which
+# placed oh5/oh3 at position 19/20.  With BsmBI cutting at position 12/13,
+# that left 6 "extra" bases in every insert — the BsmBI/BsaI overlap flaw.
+FWD_PREFIX         = "GGCTACCGTCTCG"
+REV_PREFIX         = "GGCTACCGTCTCA"
 
 # Extra EcoRV (GATATC) context added between the overhang and gene-core
 # for the outermost primers: Part A frag-1 FWD and Part E last-frag REV.
